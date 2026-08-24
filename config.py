@@ -41,8 +41,9 @@ DB_PATH: str = os.environ.get("DB_PATH", "bot.db")
 # --- Business rules ---------------------------------------------------------
 # Cancellation fee (so'm) charged when a *confirmed* order is cancelled.
 CANCEL_FEES: dict[str, int] = {
-    "kunduzgi": 15_000,  # daytime
-    "tungi": 20_000,     # nighttime
+    "kunduzgi": 0,  # daytime
+    "tungi": 0,     # nighttime
+    "bir_kun": 0,        # full day — no cancellation fee
 }
 
 # Monthly revenue is reported split 60 / 40. Integer percentages keep the math

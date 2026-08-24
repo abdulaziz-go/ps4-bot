@@ -58,7 +58,9 @@ def test_happy_path_completed_appears_in_report_with_split(conn):
 
 
 # --- Criterion 3: cancellation fees ----------------------------------------
-def test_cancel_confirmed_kunduzgi_adds_15000(conn):
+# Fees themselves are configured in config.CANCEL_FEES; these assert that a
+# cancelled *confirmed* order charges exactly the configured fee for its type.
+def test_cancel_confirmed_kunduzgi_charges_configured_fee(conn):
     now = datetime(2026, 8, 10, 9, 0, 0)
     oid = services.create_order(
         conn, customer_name="Vali", order_type="kunduzgi", amount=100_000, now=now
@@ -66,13 +68,14 @@ def test_cancel_confirmed_kunduzgi_adds_15000(conn):
     services.confirm_order(conn, oid, now=now)
     fee = services.cancel_order(conn, oid, now=now)
 
-    assert fee == 15_000
+    expected = config.CANCEL_FEES["kunduzgi"]
+    assert fee == expected
     r = services.monthly_report(conn, 2026, 8)
-    assert r["cancel_fees"] == 15_000
-    assert r["total_revenue"] == 15_000
+    assert r["cancel_fees"] == expected
+    assert r["total_revenue"] == expected
 
 
-def test_cancel_confirmed_tungi_adds_20000(conn):
+def test_cancel_confirmed_tungi_charges_configured_fee(conn):
     now = datetime(2026, 8, 10, 23, 0, 0)
     oid = services.create_order(
         conn, customer_name="Guli", order_type="tungi", amount=100_000, now=now
@@ -80,9 +83,22 @@ def test_cancel_confirmed_tungi_adds_20000(conn):
     services.confirm_order(conn, oid, now=now)
     fee = services.cancel_order(conn, oid, now=now)
 
-    assert fee == 20_000
+    expected = config.CANCEL_FEES["tungi"]
+    assert fee == expected
     r = services.monthly_report(conn, 2026, 8)
-    assert r["cancel_fees"] == 20_000
+    assert r["cancel_fees"] == expected
+
+
+def test_cancel_confirmed_bir_kun_charges_configured_fee(conn):
+    now = datetime(2026, 8, 10, 8, 0, 0)
+    oid = services.create_order(
+        conn, customer_name="Olim", order_type="bir_kun", amount=300_000,
+        start_at="2026-08-11 08:00:00", end_at="2026-08-12 08:00:00", now=now,
+    )
+    services.confirm_order(conn, oid, now=now)
+    fee = services.cancel_order(conn, oid, now=now)
+
+    assert fee == config.CANCEL_FEES["bir_kun"]
 
 
 def test_cancel_new_order_is_free(conn):
@@ -191,7 +207,7 @@ def test_split_sums_exactly_with_odd_total(conn):
 
 def test_completed_and_cancelled_combined_revenue(conn):
     now = datetime(2026, 8, 15)
-    # One completed kunduzgi (120 000) + one cancelled tungi (fee 20 000) = 140 000.
+    # One completed kunduzgi (120 000) + one cancelled tungi (its configured fee).
     o1 = services.create_order(conn, customer_name="A", order_type="kunduzgi", amount=120_000, now=now)
     services.confirm_order(conn, o1, now=now)
     services.complete_order(conn, o1, now=now)
@@ -200,10 +216,11 @@ def test_completed_and_cancelled_combined_revenue(conn):
     services.confirm_order(conn, o2, now=now)
     services.cancel_order(conn, o2, now=now)
 
+    total = 120_000 + config.CANCEL_FEES["tungi"]
     r = services.monthly_report(conn, 2026, 8)
-    assert r["total_revenue"] == 140_000
-    assert r["share_a"] == 84_000   # 60% of 140 000
-    assert r["share_b"] == 56_000   # 40% of 140 000
+    assert r["total_revenue"] == total
+    assert r["share_a"] == total * 60 // 100
+    assert r["share_b"] == total - total * 60 // 100
 
 
 # --- Reset money report + saved history -------------------------------------
@@ -264,3 +281,179 @@ def test_history_saves_every_reset(conn):
 def test_last_reset_at_none_when_never_reset(conn):
     assert services.last_reset_at(conn) is None
     assert services.last_reset_at(conn, 2026, 8) is None
+
+
+# --- Third order type: "Bir kun to'liq" ------------------------------------
+def test_bir_kun_type_is_accepted(conn):
+    oid = services.create_order(
+        conn, customer_name="Sardor", order_type="bir_kun", amount=250_000,
+        start_at="2026-08-25 08:00:00", end_at="2026-08-26 08:00:00",
+    )
+    assert services.get_order(conn, oid)["order_type"] == "bir_kun"
+
+
+def test_bir_kun_included_in_valid_types(conn):
+    assert "bir_kun" in services.VALID_TYPES
+
+
+# --- Date/time parsing ------------------------------------------------------
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("2026-08-25 09:00", "2026-08-25 09:00:00"),
+        ("2026-08-25 09:00:30", "2026-08-25 09:00:30"),
+        ("25.08.2026 09:00", "2026-08-25 09:00:00"),
+        ("25/08/2026 18:30", "2026-08-25 18:30:00"),
+        ("  2026-08-25 09:00  ", "2026-08-25 09:00:00"),
+    ],
+)
+def test_parse_dt_accepts_common_formats(raw, expected):
+    assert services.parse_dt(raw) == expected
+
+
+@pytest.mark.parametrize("raw", ["", "yesterday", "2026-13-40 99:99", "9am", "25-08-2026"])
+def test_parse_dt_rejects_garbage(raw):
+    with pytest.raises(services.OrderError):
+        services.parse_dt(raw)
+
+
+# --- Start / end scheduling on orders --------------------------------------
+def test_create_order_stores_start_and_end(conn):
+    oid = services.create_order(
+        conn, customer_name="A", order_type="kunduzgi", amount=1000,
+        start_at="2026-08-25 09:00:00", end_at="2026-08-25 18:00:00",
+    )
+    o = services.get_order(conn, oid)
+    assert o["start_at"] == "2026-08-25 09:00:00"
+    assert o["end_at"] == "2026-08-25 18:00:00"
+
+
+def test_create_order_without_schedule_leaves_nulls(conn):
+    oid = services.create_order(conn, customer_name="A", order_type="tungi", amount=1000)
+    o = services.get_order(conn, oid)
+    assert o["start_at"] is None and o["end_at"] is None
+
+
+def test_end_before_start_rejected(conn):
+    with pytest.raises(services.OrderError):
+        services.create_order(
+            conn, customer_name="A", order_type="kunduzgi", amount=1000,
+            start_at="2026-08-25 18:00:00", end_at="2026-08-25 09:00:00",
+        )
+
+
+def test_end_equal_start_rejected(conn):
+    with pytest.raises(services.OrderError):
+        services.create_order(
+            conn, customer_name="A", order_type="kunduzgi", amount=1000,
+            start_at="2026-08-25 09:00:00", end_at="2026-08-25 09:00:00",
+        )
+
+
+def test_start_without_end_rejected(conn):
+    with pytest.raises(services.OrderError):
+        services.create_order(
+            conn, customer_name="A", order_type="kunduzgi", amount=1000,
+            start_at="2026-08-25 09:00:00",
+        )
+
+
+# --- Overlap detection (queue clashes) -------------------------------------
+def _scheduled(conn, start, end, name="X", status_confirm=False):
+    oid = services.create_order(
+        conn, customer_name=name, order_type="kunduzgi", amount=1000,
+        start_at=start, end_at=end,
+    )
+    if status_confirm:
+        services.confirm_order(conn, oid)
+    return oid
+
+
+def test_find_overlaps_detects_clash(conn):
+    _scheduled(conn, "2026-08-25 09:00:00", "2026-08-25 12:00:00", name="First")
+    clashes = services.find_overlaps(conn, "2026-08-25 11:00:00", "2026-08-25 13:00:00")
+    assert [c["customer_name"] for c in clashes] == ["First"]
+
+
+def test_adjacent_windows_do_not_overlap(conn):
+    _scheduled(conn, "2026-08-25 09:00:00", "2026-08-25 12:00:00")
+    # New window starts exactly when the other ends -> no clash.
+    assert services.find_overlaps(conn, "2026-08-25 12:00:00", "2026-08-25 15:00:00") == []
+
+
+def test_find_overlaps_ignores_completed_and_cancelled(conn):
+    oid = _scheduled(conn, "2026-08-25 09:00:00", "2026-08-25 12:00:00", status_confirm=True)
+    services.complete_order(conn, oid)
+    # A completed order no longer occupies its slot.
+    assert services.find_overlaps(conn, "2026-08-25 10:00:00", "2026-08-25 11:00:00") == []
+
+
+def test_find_overlaps_excludes_self(conn):
+    oid = _scheduled(conn, "2026-08-25 09:00:00", "2026-08-25 12:00:00")
+    assert services.find_overlaps(
+        conn, "2026-08-25 09:00:00", "2026-08-25 12:00:00", exclude_id=oid
+    ) == []
+
+
+# --- Queue ordering ---------------------------------------------------------
+def test_list_orders_queue_is_chronological(conn):
+    _scheduled(conn, "2026-08-25 15:00:00", "2026-08-25 16:00:00", name="late")
+    _scheduled(conn, "2026-08-25 09:00:00", "2026-08-25 10:00:00", name="early")
+    _scheduled(conn, "2026-08-25 12:00:00", "2026-08-25 13:00:00", name="mid")
+    rows = services.list_orders(conn, statuses=["new", "confirmed"], order_by="queue")
+    assert [r["customer_name"] for r in rows] == ["early", "mid", "late"]
+
+
+# --- Migration of an older database ----------------------------------------
+_OLD_SCHEMA = """
+CREATE TABLE orders (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    customer_name TEXT    NOT NULL,
+    phone         TEXT,
+    address       TEXT,
+    order_type    TEXT    NOT NULL CHECK (order_type IN ('kunduzgi', 'tungi')),
+    amount        INTEGER NOT NULL DEFAULT 0,
+    status        TEXT    NOT NULL DEFAULT 'new'
+                          CHECK (status IN ('new', 'confirmed', 'completed', 'cancelled')),
+    cancel_fee    INTEGER NOT NULL DEFAULT 0,
+    created_by    INTEGER,
+    created_at    TEXT    NOT NULL,
+    confirmed_at  TEXT,
+    completed_at  TEXT,
+    cancelled_at  TEXT
+);
+"""
+
+
+def test_migrate_upgrades_old_database(tmp_path):
+    db = tmp_path / "legacy.db"
+    conn = database.get_connection(str(db))
+    conn.executescript(_OLD_SCHEMA)
+    conn.execute(
+        "INSERT INTO orders (customer_name, order_type, amount, created_at) "
+        "VALUES ('Legacy', 'tungi', 50000, '2026-08-01 10:00:00')"
+    )
+    conn.commit()
+
+    database._migrate(conn)
+
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(orders)")}
+    assert {"start_at", "end_at"} <= cols
+    # Legacy data is preserved through the table rebuild.
+    assert conn.execute("SELECT customer_name FROM orders").fetchone()["customer_name"] == "Legacy"
+    # The widened CHECK now accepts the new type (would raise on the old schema).
+    services.create_order(
+        conn, customer_name="New", order_type="bir_kun", amount=1000,
+        start_at="2026-08-02 09:00:00", end_at="2026-08-02 18:00:00",
+    )
+    conn.close()
+
+
+def test_migrate_is_idempotent(tmp_path):
+    db = tmp_path / "fresh.db"
+    conn = database.init_db(str(db))
+    # Running the migration again on an already-current DB must be a no-op.
+    database._migrate(conn)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(orders)")}
+    assert {"start_at", "end_at"} <= cols
+    conn.close()

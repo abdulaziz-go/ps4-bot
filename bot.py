@@ -24,7 +24,11 @@ conn = database.init_db()
 # In-memory per-chat draft state during order creation.
 _drafts: dict[int, dict] = {}
 
-TYPE_LABELS = {"kunduzgi": "🌞 Kunduzgi", "tungi": "🌙 Tungi"}
+TYPE_LABELS = {
+    "kunduzgi": "🌞 Kunduzgi",
+    "tungi": "🌙 Tungi",
+    "bir_kun": "🌗 Bir kun to'liq",
+}
 STATUS_LABELS = {
     "new": "🆕 Yangi",
     "confirmed": "✅ Tasdiqlangan",
@@ -65,6 +69,11 @@ def esc(s) -> str:
     return html.escape(str(s)) if s else ""
 
 
+def fmt_dt(value) -> str:
+    """Show a stored 'YYYY-MM-DD HH:MM:SS' timestamp without the seconds."""
+    return str(value)[:16] if value else "—"
+
+
 def _guard(message) -> bool:
     """Reject non-admin messages. Returns True if allowed."""
     if not config.is_admin(message.from_user.id):
@@ -78,6 +87,30 @@ def _guard_cb(call) -> bool:
         bot.answer_callback_query(call.id, "⛔ Ruxsat yo'q", show_alert=True)
         return False
     return True
+
+
+def _user_label(u) -> str:
+    """Readable name for a Telegram user, for notifications."""
+    name = " ".join(filter(None, [u.first_name, u.last_name])).strip()
+    if u.username:
+        return f"{name} (@{u.username})" if name else f"@{u.username}"
+    return name or f"ID {u.id}"
+
+
+def _notify_superadmins(text: str, exclude_id: int | None = None) -> None:
+    """Best-effort push of ``text`` to every superadmin.
+
+    ``exclude_id`` skips one recipient (e.g. the person who triggered the event
+    and already saw the result). A superadmin who never started the bot / blocked
+    it must not break the action for everyone else, so send failures are ignored.
+    """
+    for sid in config.SUPERADMIN_IDS:
+        if sid == exclude_id:
+            continue
+        try:
+            bot.send_message(sid, text)
+        except Exception:
+            pass
 
 
 def main_menu(user_id: int) -> types.ReplyKeyboardMarkup:
@@ -101,6 +134,9 @@ def format_order(o) -> str:
     if o["address"]:
         lines.append(f"📍 Manzil: {esc(o['address'])}")
     lines.append(f"🕒 Turi: {TYPE_LABELS.get(o['order_type'], o['order_type'])}")
+    if o["start_at"] or o["end_at"]:
+        lines.append(f"🟢 Boshlanish: {fmt_dt(o['start_at'])}")
+        lines.append(f"🔴 Tugash: {fmt_dt(o['end_at'])}")
     lines.append(f"💰 Summa: {money(o['amount'])} so'm")
     lines.append(f"Holat: {STATUS_LABELS.get(o['status'], o['status'])}")
     if o["status"] == "cancelled" and o["cancel_fee"]:
@@ -132,6 +168,24 @@ def format_report(r) -> str:
         f"💰 Jami tushum: <b>{money(r['total_revenue'])} so'm</b>\n\n"
         f"{config.SPLIT_A_LABEL}: {money(r['share_a'])} so'm\n"
         f"{config.SPLIT_B_LABEL}: {money(r['share_b'])} so'm"
+    )
+
+
+def format_reset_entry(row, index: int) -> str:
+    """One saved reset snapshot for the history list.
+
+    Each entry is a numbered, self-contained block. Unlike ``format_report`` it
+    has no internal ruler line — a single divider is placed *between* entries by
+    the caller, so stacked snapshots read as separate cards instead of merging.
+    """
+    return (
+        f"🗂 <b>#{index}</b> · 🕒 <i>{esc(row['reset_at'])}</i>\n"
+        f"📅 Davr: <b>{row['year']}-{row['month']:02d}</b>\n"
+        f"☑️ Yakunlangan: {row['completed_count']} ta — {money(row['completed_amount'])} so'm\n"
+        f"❌ Bekor (to'lov): {row['cancelled_count']} ta — {money(row['cancel_fees'])} so'm\n"
+        f"💰 Jami tushum: <b>{money(row['total_revenue'])} so'm</b>\n"
+        f"{config.SPLIT_A_LABEL}: {money(row['share_a'])} so'm\n"
+        f"{config.SPLIT_B_LABEL}: {money(row['share_b'])} so'm"
     )
 
 
@@ -171,7 +225,52 @@ def _step_phone(message):
         types.InlineKeyboardButton("🌞 Kunduzgi", callback_data="type:kunduzgi"),
         types.InlineKeyboardButton("🌙 Tungi", callback_data="type:tungi"),
     )
+    kb.add(types.InlineKeyboardButton("🌗 Bir kun to'liq", callback_data="type:bir_kun"))
     bot.send_message(message.chat.id, "Buyurtma turini tanlang:", reply_markup=kb)
+
+
+def _step_start(message):
+    if not _guard(message):
+        return
+    if _intercept(message):
+        return
+    try:
+        start_at = services.parse_dt(message.text)
+    except services.OrderError as e:
+        msg = bot.reply_to(message, f"❌ {e}")
+        bot.register_next_step_handler(msg, _step_start)
+        return
+    _drafts.setdefault(message.chat.id, {})["start_at"] = start_at
+    msg = bot.send_message(
+        message.chat.id,
+        "🔴 Tugash sana va vaqtini kiriting.\nMasalan: 2026-08-25 18:00",
+    )
+    bot.register_next_step_handler(msg, _step_end)
+
+
+def _step_end(message):
+    if not _guard(message):
+        return
+    if _intercept(message):
+        return
+    try:
+        end_at = services.parse_dt(message.text)
+    except services.OrderError as e:
+        msg = bot.reply_to(message, f"❌ {e}")
+        bot.register_next_step_handler(msg, _step_end)
+        return
+    draft = _drafts.setdefault(message.chat.id, {})
+    if draft.get("start_at") and end_at <= draft["start_at"]:
+        msg = bot.reply_to(
+            message,
+            "❌ Tugash vaqti boshlanish vaqtidan keyin bo'lishi kerak. "
+            "Qaytadan kiriting:",
+        )
+        bot.register_next_step_handler(msg, _step_end)
+        return
+    draft["end_at"] = end_at
+    msg = bot.send_message(message.chat.id, "💰 Summani kiriting (so'm):")
+    bot.register_next_step_handler(msg, _step_amount)
 
 
 def _step_amount(message):
@@ -188,6 +287,11 @@ def _step_amount(message):
         bot.register_next_step_handler(msg, _step_amount)
         return
 
+    start_at = draft.get("start_at")
+    end_at = draft.get("end_at")
+    # "Warn but allow": surface any queue clash but still create the order.
+    clashes = services.find_overlaps(conn, start_at, end_at) if start_at and end_at else []
+
     try:
         oid = services.create_order(
             conn,
@@ -195,6 +299,8 @@ def _step_amount(message):
             order_type=draft.get("order_type", "kunduzgi"),
             amount=amount,
             phone=draft.get("phone"),
+            start_at=start_at,
+            end_at=end_at,
             created_by=message.from_user.id,
         )
     except services.OrderError as e:
@@ -203,14 +309,35 @@ def _step_amount(message):
 
     _drafts.pop(message.chat.id, None)
     o = services.get_order(conn, oid)
-    bot.send_message(message.chat.id, format_order(o), reply_markup=order_markup(o))
+    text = format_order(o)
+    if clashes:
+        conflict_lines = "\n".join(
+            f"• #{c['id']} {fmt_dt(c['start_at'])} — {fmt_dt(c['end_at'])} "
+            f"({esc(c['customer_name'])})"
+            for c in clashes
+        )
+        text += (
+            f"\n\n⚠️ <b>Diqqat:</b> bu vaqt oralig'ida {len(clashes)} ta "
+            f"buyurtma bor:\n{conflict_lines}"
+        )
+    bot.send_message(message.chat.id, text, reply_markup=order_markup(o))
+
+    # Notify every superadmin about the new order (skip the creator, who just
+    # saw the card above). Reuses `text`, so clashes are surfaced to them too.
+    _notify_superadmins(
+        f"🔔 <b>Yangi buyurtma yaratildi</b>\n"
+        f"👨‍💼 Kim: {esc(_user_label(message.from_user))}\n\n{text}",
+        exclude_id=message.from_user.id,
+    )
 
 
 def _do_list(message):
-    rows = services.list_orders(conn, statuses=["new", "confirmed"])
+    # Ordered as a queue: by scheduled start time, earliest first.
+    rows = services.list_orders(conn, statuses=["new", "confirmed"], order_by="queue")
     if not rows:
         bot.reply_to(message, "Aktiv buyurtmalar yo'q.")
         return
+    bot.send_message(message.chat.id, f"📋 <b>Navbat</b> ({len(rows)} ta):")
     for o in rows:
         bot.send_message(message.chat.id, format_order(o), reply_markup=order_markup(o))
 
@@ -226,6 +353,8 @@ def _do_history(message):
             f"#{o['id']} {STATUS_LABELS.get(o['status'], o['status'])} — "
             f"{esc(o['customer_name'])} — {money(o['amount'])} so'm"
         )
+        if o["start_at"]:
+            line += f" — 🕒 {fmt_dt(o['start_at'])}"
         if o["status"] == "cancelled" and o["cancel_fee"]:
             line += f" (jarima {money(o['cancel_fee'])})"
         lines.append(line)
@@ -243,10 +372,10 @@ def _do_reset_history(message):
     if not rows:
         bot.reply_to(message, "🗂 Hisobot tarixi bo'sh. Hali nollash amalga oshirilmagan.")
         return
-    parts = ["🗂 <b>Nollangan hisobotlar tarixi</b> (oxirgi 10):"]
-    for row in rows:
-        parts.append(f"\n🕒 <i>{esc(row['reset_at'])}</i>\n{format_report(row)}")
-    bot.send_message(message.chat.id, "\n".join(parts))
+    header = "🗂 <b>Nollangan hisobotlar tarixi</b> (oxirgi 10):"
+    divider = "\n➖➖➖➖➖➖➖➖➖➖➖➖\n"
+    entries = [format_reset_entry(row, i) for i, row in enumerate(rows, start=1)]
+    bot.send_message(message.chat.id, header + divider + divider.join(entries))
 
 
 def _do_reset(message):
@@ -364,11 +493,12 @@ def cb_type(call):
     order_type = call.data.split(":", 1)[1]
     _drafts.setdefault(call.message.chat.id, {})["order_type"] = order_type
     bot.edit_message_text(
-        f"Tur: {TYPE_LABELS[order_type]}\n💰 Summani kiriting (so'm):",
+        f"Tur: {TYPE_LABELS[order_type]}\n\n"
+        "🟢 Boshlanish sana va vaqtini kiriting.\nMasalan: 2026-08-25 09:00",
         call.message.chat.id,
         call.message.message_id,
     )
-    bot.register_next_step_handler(call.message, _step_amount)
+    bot.register_next_step_handler(call.message, _step_start)
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("confirm:"))

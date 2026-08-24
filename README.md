@@ -1,8 +1,9 @@
 # Buyurtmalar boti (Telegram order bot)
 
-Admin-only Telegram bot for tracking service orders (kunduzgi / tungi),
-confirming and completing them, cancelling with a fee, and producing a monthly
-revenue report split **60 / 40**.
+Admin-only Telegram bot for tracking service orders
+(kunduzgi / tungi / bir kun to'liq), each with a scheduled start/end time so
+many orders can be managed as a queue — confirming and completing them,
+cancelling with a fee, and producing a monthly revenue report split **60 / 40**.
 
 ## Features
 
@@ -12,20 +13,33 @@ revenue report split **60 / 40**.
   (`➕ Yangi buyurtma`, `📋 Buyurtmalar`, `📚 Tarix`, `📊 Hisobot`,
   `🗂 Hisobot tarixi`, and `♻️ Hisobotni nollash` for superadmins). The old
   slash commands still work as aliases.
-- **Order creation** collects a **client name** and an **optional phone number**
-  (send `-` to skip), then order type and amount.
+- **Order creation** collects a **client name**, an **optional phone number**
+  (send `-` to skip), the **order type** (🌞 Kunduzgi / 🌙 Tungi /
+  🌗 Bir kun to'liq), the **scheduled start and end date-time**, and the amount.
+- **Scheduling & queue.** Every order has an exact start/end date-time (e.g.
+  `2026-08-25 09:00`; `25.08.2026 09:00` also accepted). The active list
+  (`📋 Buyurtmalar`) is shown as a **queue ordered by start time**. When a new
+  order's window overlaps an existing active one, the bot **warns but still
+  creates it** (it lists the clashing orders).
+- **Superadmin notifications.** Whenever anyone creates a new order, every
+  `SUPERADMIN_IDS` user is pushed a `🔔 Yangi buyurtma yaratildi` message with
+  who created it and the full order details (including any queue clash). Delivery
+  is best-effort — a superadmin who hasn't started the bot is skipped silently.
 - **Order lifecycle** via inline buttons:
   `🆕 Yangi → ✅ Tasdiqlash → ☑️ Yakunlash` (with `❌ Bekor qilish` and a
   `Ha / Yo'q` confirmation step).
 - **Order history** (`📚 Tarix`): the last 20 completed / cancelled orders.
 - **Cancellation fee** added to monthly revenue when a *confirmed* order is
-  cancelled: **15 000 so'm** (kunduzgi) / **20 000 so'm** (tungi).
+  cancelled. The per-type fee is configured in `config.CANCEL_FEES`
+  (`bir kun to'liq` has **no** cancellation fee).
 - **Monthly report** (`📊 Hisobot`): completed amounts + cancellation fees, with a
   60 / 40 split (exact integer math).
 - **Reset report (superadmin).** `♻️ Hisobotni nollash` shows the current report
   and asks for `Ha / Yo'q` confirmation. On confirm, the current income and
   counts are **saved to history** and the running total is reset to **0** —
-  **no orders are deleted**. Past snapshots are viewable via `🗂 Hisobot tarixi`.
+  **no orders are deleted**. Past snapshots are viewable via `🗂 Hisobot tarixi`,
+  where each reset is shown as a **separate numbered card** with a divider
+  between entries (so stacked snapshots no longer blur together).
 - **SQLite storage**, created automatically on first run.
 
 ## Setup & run
@@ -69,9 +83,11 @@ pytest -q
 ```
 
 Tests exercise the service/DB layer directly (no Telegram, no network) and
-cover DB auto-creation, the full happy path with the 60/40 split, both
-cancellation fees, admin/superadmin roles, the optional phone field, the
-state-machine guards, and the report reset + saved history.
+cover DB auto-creation and migration of an older DB, the full happy path with
+the 60/40 split, the configured cancellation fees, all three order types,
+date-time parsing, start/end scheduling with overlap (queue-clash) detection,
+admin/superadmin roles, the optional phone field, the state-machine guards, and
+the report reset + saved history.
 
 ## Project layout
 

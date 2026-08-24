@@ -13,11 +13,16 @@ CREATE TABLE IF NOT EXISTS orders (
     customer_name TEXT    NOT NULL,
     phone         TEXT,
     address       TEXT,
-    order_type    TEXT    NOT NULL CHECK (order_type IN ('kunduzgi', 'tungi')),
+    order_type    TEXT    NOT NULL CHECK (order_type IN ('kunduzgi', 'tungi', 'bir_kun')),
     amount        INTEGER NOT NULL DEFAULT 0,
     status        TEXT    NOT NULL DEFAULT 'new'
                           CHECK (status IN ('new', 'confirmed', 'completed', 'cancelled')),
     cancel_fee    INTEGER NOT NULL DEFAULT 0,
+    -- Scheduled service window (the order's slot in the queue). Stored as
+    -- 'YYYY-MM-DD HH:MM:SS' so string comparison == chronological order.
+    -- Nullable so pre-scheduling rows still load.
+    start_at      TEXT,
+    end_at        TEXT,
     created_by    INTEGER,
     created_at    TEXT    NOT NULL,
     confirmed_at  TEXT,
@@ -26,6 +31,8 @@ CREATE TABLE IF NOT EXISTS orders (
 );
 
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders (status);
+-- NB: the start_at index is created in _migrate(), after that column is
+-- guaranteed to exist — this SCHEMA also runs against pre-scheduling databases.
 
 -- Each row is an immutable snapshot of the monthly report captured the moment
 -- a superadmin reset it. Resetting never deletes orders — it just records the
@@ -61,9 +68,75 @@ def get_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
     return conn
 
 
+# Rebuilds the `orders` table with the current schema. Used by the migration to
+# widen the `order_type` CHECK constraint, which SQLite cannot ALTER in place.
+# Columns are copied by name, so it is safe regardless of the old column order.
+_REBUILD_ORDERS = """
+BEGIN;
+CREATE TABLE orders_new (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    customer_name TEXT    NOT NULL,
+    phone         TEXT,
+    address       TEXT,
+    order_type    TEXT    NOT NULL CHECK (order_type IN ('kunduzgi', 'tungi', 'bir_kun')),
+    amount        INTEGER NOT NULL DEFAULT 0,
+    status        TEXT    NOT NULL DEFAULT 'new'
+                          CHECK (status IN ('new', 'confirmed', 'completed', 'cancelled')),
+    cancel_fee    INTEGER NOT NULL DEFAULT 0,
+    start_at      TEXT,
+    end_at        TEXT,
+    created_by    INTEGER,
+    created_at    TEXT    NOT NULL,
+    confirmed_at  TEXT,
+    completed_at  TEXT,
+    cancelled_at  TEXT
+);
+INSERT INTO orders_new
+    (id, customer_name, phone, address, order_type, amount, status, cancel_fee,
+     start_at, end_at, created_by, created_at, confirmed_at, completed_at, cancelled_at)
+SELECT
+     id, customer_name, phone, address, order_type, amount, status, cancel_fee,
+     start_at, end_at, created_by, created_at, confirmed_at, completed_at, cancelled_at
+  FROM orders;
+DROP TABLE orders;
+ALTER TABLE orders_new RENAME TO orders;
+COMMIT;
+CREATE INDEX IF NOT EXISTS idx_orders_status ON orders (status);
+CREATE INDEX IF NOT EXISTS idx_orders_start ON orders (start_at);
+"""
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Upgrade an existing DB in place: add scheduling columns and the new type.
+
+    Idempotent — safe to run on every startup and on a freshly-created DB (where
+    it is a no-op because ``SCHEMA`` already produced the current shape).
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(orders)")}
+    if "start_at" not in cols:
+        conn.execute("ALTER TABLE orders ADD COLUMN start_at TEXT")
+    if "end_at" not in cols:
+        conn.execute("ALTER TABLE orders ADD COLUMN end_at TEXT")
+    conn.commit()
+
+    # Widen the order_type CHECK to allow 'bir_kun'. The constraint lives in the
+    # table's CREATE SQL, so detect the old shape by its absence and rebuild.
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='orders'"
+    ).fetchone()
+    if row and "bir_kun" not in row["sql"]:
+        conn.executescript(_REBUILD_ORDERS)
+        conn.commit()
+
+    # Safe on every path now that start_at is guaranteed to exist.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_start ON orders (start_at)")
+    conn.commit()
+
+
 def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
-    """Create the schema if missing and return an open connection."""
+    """Create the schema if missing, migrate older DBs, and return the connection."""
     conn = get_connection(db_path)
     conn.executescript(SCHEMA)
     conn.commit()
+    _migrate(conn)
     return conn

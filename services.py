@@ -10,7 +10,22 @@ from datetime import datetime
 
 from config import CANCEL_FEES, SPLIT_A_PCT
 
-VALID_TYPES = ("kunduzgi", "tungi")
+VALID_TYPES = ("kunduzgi", "tungi", "bir_kun")
+
+# Active statuses that occupy a slot in the schedule (used for overlap checks
+# and the queue listing). Completed / cancelled orders no longer hold a slot.
+ACTIVE_STATUSES = ("new", "confirmed")
+
+# Accepted input formats for start/end date-times, tried in order. All normalise
+# to '%Y-%m-%d %H:%M:%S' so stored strings sort chronologically.
+_DT_FORMATS = (
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M",
+    "%d.%m.%Y %H:%M:%S",
+    "%d.%m.%Y %H:%M",
+    "%d/%m/%Y %H:%M:%S",
+    "%d/%m/%Y %H:%M",
+)
 
 
 class OrderError(Exception):
@@ -21,6 +36,25 @@ def _now_iso(now: datetime | None = None) -> str:
     return (now or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def parse_dt(raw: str) -> str:
+    """Parse a user-supplied date-time into canonical 'YYYY-MM-DD HH:MM:SS'.
+
+    Accepts a few common orderings (ISO ``2026-08-25 09:00`` and dotted/slashed
+    ``25.08.2026 09:00``). Raises ``OrderError`` on anything unrecognised so the
+    caller can re-prompt.
+    """
+    text = (raw or "").strip()
+    for fmt in _DT_FORMATS:
+        try:
+            return datetime.strptime(text, fmt).strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+    raise OrderError(
+        "Sana/vaqt formati noto'g'ri. Masalan: 2026-08-25 09:00 "
+        "yoki 25.08.2026 09:00"
+    )
+
+
 def create_order(
     conn: sqlite3.Connection,
     *,
@@ -29,10 +63,17 @@ def create_order(
     amount: int,
     phone: str | None = None,
     address: str | None = None,
+    start_at: str | None = None,
+    end_at: str | None = None,
     created_by: int | None = None,
     now: datetime | None = None,
 ) -> int:
-    """Insert a new order (status='new') and return its id."""
+    """Insert a new order (status='new') and return its id.
+
+    ``start_at`` / ``end_at`` are the scheduled service window (canonical
+    'YYYY-MM-DD HH:MM:SS' strings — see ``parse_dt``). They must be supplied
+    together, with the end strictly after the start.
+    """
     if order_type not in VALID_TYPES:
         raise OrderError(f"Noto'g'ri buyurtma turi: {order_type!r}")
     if not customer_name or not customer_name.strip():
@@ -40,34 +81,78 @@ def create_order(
     amount = int(amount)
     if amount < 0:
         raise OrderError("Summa manfiy bo'lishi mumkin emas")
+    if (start_at is None) != (end_at is None):
+        raise OrderError("Boshlanish va tugash vaqti birga kiritilishi kerak")
+    if start_at is not None and end_at <= start_at:
+        raise OrderError("Tugash vaqti boshlanish vaqtidan keyin bo'lishi kerak")
 
     cur = conn.execute(
         """INSERT INTO orders
-               (customer_name, phone, address, order_type, amount, status, created_by, created_at)
-           VALUES (?, ?, ?, ?, ?, 'new', ?, ?)""",
-        (customer_name.strip(), phone, address, order_type, amount, created_by, _now_iso(now)),
+               (customer_name, phone, address, order_type, amount, status,
+                start_at, end_at, created_by, created_at)
+           VALUES (?, ?, ?, ?, ?, 'new', ?, ?, ?, ?)""",
+        (customer_name.strip(), phone, address, order_type, amount,
+         start_at, end_at, created_by, _now_iso(now)),
     )
     conn.commit()
     return cur.lastrowid
+
+
+def find_overlaps(
+    conn: sqlite3.Connection,
+    start_at: str,
+    end_at: str,
+    exclude_id: int | None = None,
+    statuses: tuple[str, ...] = ACTIVE_STATUSES,
+) -> list[sqlite3.Row]:
+    """Return active orders whose scheduled window overlaps ``[start_at, end_at)``.
+
+    Two windows overlap when ``start_at < other.end_at AND end_at > other.start_at``.
+    Used to warn (not block) when a new order lands on top of one already queued.
+    """
+    placeholders = ",".join("?" * len(statuses))
+    return conn.execute(
+        f"""SELECT * FROM orders
+             WHERE status IN ({placeholders})
+               AND start_at IS NOT NULL AND end_at IS NOT NULL
+               AND ? < end_at AND ? > start_at
+               AND (? IS NULL OR id != ?)
+             ORDER BY start_at ASC, id ASC""",
+        (*statuses, start_at, end_at, exclude_id, exclude_id),
+    ).fetchall()
 
 
 def get_order(conn: sqlite3.Connection, order_id: int) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
 
 
+# Whitelisted ORDER BY clauses. Kept as a fixed map (never interpolate caller
+# input into SQL): history reads newest-first, the active queue reads by slot.
+_ORDER_BY = {
+    "id_desc": "id DESC",
+    # Chronological queue; scheduled orders first, undated legacy rows last.
+    "queue": "start_at IS NULL, start_at ASC, id ASC",
+}
+
+
 def list_orders(
     conn: sqlite3.Connection,
     statuses: list[str] | None = None,
     limit: int | None = None,
+    order_by: str = "id_desc",
 ) -> list[sqlite3.Row]:
+    order_clause = _ORDER_BY.get(order_by, _ORDER_BY["id_desc"])
     limit_clause = f" LIMIT {int(limit)}" if limit else ""
     if statuses:
         placeholders = ",".join("?" * len(statuses))
         return conn.execute(
-            f"SELECT * FROM orders WHERE status IN ({placeholders}) ORDER BY id DESC{limit_clause}",
+            f"SELECT * FROM orders WHERE status IN ({placeholders}) "
+            f"ORDER BY {order_clause}{limit_clause}",
             tuple(statuses),
         ).fetchall()
-    return conn.execute(f"SELECT * FROM orders ORDER BY id DESC{limit_clause}").fetchall()
+    return conn.execute(
+        f"SELECT * FROM orders ORDER BY {order_clause}{limit_clause}"
+    ).fetchall()
 
 
 def confirm_order(conn: sqlite3.Connection, order_id: int, now: datetime | None = None) -> sqlite3.Row:
