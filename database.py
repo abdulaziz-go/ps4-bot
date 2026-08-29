@@ -53,6 +53,29 @@ CREATE TABLE IF NOT EXISTS resets (
 );
 
 CREATE INDEX IF NOT EXISTS idx_resets_period ON resets (year, month);
+
+-- Physical inventory: each PlayStation / joystick is one row, added by name.
+-- A device has NO status column on purpose — "busy" is derived from whether it
+-- is linked to an active (new/confirmed) order (see services.list_devices),
+-- which avoids the classic status-out-of-sync bug.
+CREATE TABLE IF NOT EXISTS devices (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT    NOT NULL,
+    dtype      TEXT    NOT NULL CHECK (dtype IN ('playstation', 'joystick')),
+    created_at TEXT
+);
+
+-- Which devices were handed out for which order. Link rows are kept even after
+-- the order finishes, for history; uniqueness stops a device being attached
+-- twice to the same order.
+CREATE TABLE IF NOT EXISTS order_devices (
+    order_id  INTEGER NOT NULL REFERENCES orders (id),
+    device_id INTEGER NOT NULL REFERENCES devices (id),
+    UNIQUE (order_id, device_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_order_devices_order  ON order_devices (order_id);
+CREATE INDEX IF NOT EXISTS idx_order_devices_device ON order_devices (device_id);
 """
 
 

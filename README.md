@@ -28,6 +28,26 @@ cancelling with a fee, and producing a monthly revenue report split **60 / 40**.
 - **Order lifecycle** via inline buttons:
   `🆕 Yangi → ✅ Tasdiqlash → ☑️ Yakunlash` (with `❌ Bekor qilish` and a
   `Ha / Yo'q` confirmation step).
+- **Device inventory** (`🎮 Qurilmalar`). PlayStations and joysticks are added by
+  name and shown grouped by type with `🟢 Bo'sh` / `🔴 Band` status and per-type
+  totals. A device is **busy** whenever it is linked to an active (`new` /
+  `confirmed`) order and frees automatically when that order is completed or
+  cancelled (status is always derived, never stored). Busy devices can't be
+  deleted. Order creation now also asks which **PlayStation** and which
+  **joysticks** were handed out, and every order card / history line shows them.
+- **Group announcements.** The bot is **silent in every group / supergroup /
+  channel** — it never replies to group messages. It only *pushes* customer-facing
+  device-availability announcements (HTML-formatted, Uzbek, no client data) to
+  `GROUP_CHAT_ID`: a snapshot of still-free devices when an order is created and
+  when it is confirmed, and a "devices freed up" notice when an order is completed
+  or an active order is cancelled. Group sends are best-effort — a failure never
+  breaks the order flow.
+- **Discount announcements** (`📣 E'lon (Aksiya)`). Compose a customer-facing
+  promo: the bot asks for the aksiya **period as free text** (e.g. "Dushanba va
+  Seshanba kunlari"), a discounted **fixed price**, and your **own message
+  text**, then shows a preview with a `✅ Guruhga yuborish` button. Nothing is
+  posted until you tap it — then the HTML-formatted announcement goes to
+  `GROUP_CHAT_ID`.
 - **Order history** (`📚 Tarix`): the last 20 completed / cancelled orders.
 - **Cancellation fee** added to monthly revenue when a *confirmed* order is
   cancelled. The per-type fee is configured in `config.CANCEL_FEES`
@@ -69,6 +89,8 @@ Press `/start`, then use the buttons. Each button has a slash-command alias:
 | `➕ Yangi buyurtma`     | `/yangi`       | Create a new order (name + phone)    |
 | `📋 Buyurtmalar`       | `/buyurtmalar` | List active orders                   |
 | `📚 Tarix`             | `/tarix`       | Order history (last 20)              |
+| `🎮 Qurilmalar`        | `/qurilmalar`  | Device inventory (PlayStation/joystik) |
+| `📣 E'lon (Aksiya)`    | `/elon`        | Compose & send a discount announcement |
 | `📊 Hisobot`           | `/hisobot`     | Current month's report               |
 | `🗂 Hisobot tarixi`    | —              | Saved report snapshots (resets)      |
 | `♻️ Hisobotni nollash` | `/nollash`     | Reset the report (superadmin only)   |
@@ -113,6 +135,7 @@ tg-bot/
 | `BOT_TOKEN`       | *(required)*   | Telegram bot token from @BotFather          |
 | `ADMIN_IDS`       | *(empty)*      | Comma-separated allowed Telegram user IDs   |
 | `SUPERADMIN_IDS`  | *(empty)*      | IDs allowed to reset the report (also admins) |
+| `GROUP_CHAT_ID`   | `-1004439378633` | Group/supergroup ID for device-availability announcements (int) |
 | `DB_PATH`         | `bot.db`       | SQLite file path                            |
 | `SPLIT_A_LABEL`   | `Firma (60%)`  | Label for the 60% share in reports          |
 | `SPLIT_B_LABEL`   | `Xodim (40%)`  | Label for the 40% share in reports          |

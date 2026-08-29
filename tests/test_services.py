@@ -457,3 +457,183 @@ def test_migrate_is_idempotent(tmp_path):
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(orders)")}
     assert {"start_at", "end_at"} <= cols
     conn.close()
+
+
+# --- Devices: inventory ----------------------------------------------------
+def test_add_and_list_devices_of_both_types(conn):
+    services.add_device(conn, name="PS5 №1", dtype="playstation")
+    services.add_device(conn, name="Joystik A", dtype="joystick")
+    services.add_device(conn, name="Joystik B", dtype="joystick")
+
+    ps = services.list_devices(conn, "playstation")
+    js = services.list_devices(conn, "joystick")
+    assert [d["name"] for d in ps] == ["PS5 №1"]
+    assert [d["name"] for d in js] == ["Joystik A", "Joystik B"]
+    # Freshly added devices are free.
+    assert all(not d["is_busy"] for d in ps + js)
+
+
+def test_add_device_rejects_empty_name(conn):
+    with pytest.raises(services.OrderError):
+        services.add_device(conn, name="   ", dtype="joystick")
+
+
+def test_add_device_rejects_duplicate_name_case_insensitive(conn):
+    services.add_device(conn, name="PS5 №1", dtype="playstation")
+    with pytest.raises(services.OrderError):
+        services.add_device(conn, name="ps5 №1", dtype="joystick")
+
+
+def test_add_device_rejects_invalid_type(conn):
+    with pytest.raises(services.OrderError):
+        services.add_device(conn, name="X", dtype="xbox")
+
+
+# --- Devices: busy/free derivation across the lifecycle --------------------
+def _order_with_devices(conn, device_ids, now=None):
+    return services.create_order(
+        conn, customer_name="A", order_type="kunduzgi", amount=1000,
+        device_ids=device_ids, now=now,
+    )
+
+
+def test_device_busy_when_new_still_busy_when_confirmed_free_after_completed(conn):
+    ps = services.add_device(conn, name="PS5 №1", dtype="playstation")
+    oid = _order_with_devices(conn, [ps])
+
+    assert services.get_device(conn, ps)["is_busy"] == 1          # new -> busy
+    services.confirm_order(conn, oid)
+    assert services.get_device(conn, ps)["is_busy"] == 1          # confirmed -> busy
+    services.complete_order(conn, oid)
+    assert services.get_device(conn, ps)["is_busy"] == 0          # completed -> free
+    # The link row is kept for history.
+    assert [d["id"] for d in services.order_devices(conn, oid)] == [ps]
+
+
+def test_cancellation_frees_device(conn):
+    js = services.add_device(conn, name="Joystik A", dtype="joystick")
+    oid = _order_with_devices(conn, [js])
+    assert services.get_device(conn, js)["is_busy"] == 1
+    services.cancel_order(conn, oid)
+    assert services.get_device(conn, js)["is_busy"] == 0
+
+
+def test_only_free_devices_listed(conn):
+    ps1 = services.add_device(conn, name="PS5 №1", dtype="playstation")
+    services.add_device(conn, name="PS5 №2", dtype="playstation")
+    _order_with_devices(conn, [ps1])
+    free = services.list_devices(conn, "playstation", only_free=True)
+    assert [d["name"] for d in free] == ["PS5 №2"]
+
+
+# --- Devices: delete guards ------------------------------------------------
+def test_cannot_delete_busy_device_but_can_once_free(conn):
+    js = services.add_device(conn, name="Joystik A", dtype="joystick")
+    oid = _order_with_devices(conn, [js])
+    with pytest.raises(services.OrderError):
+        services.delete_device(conn, js)
+    services.confirm_order(conn, oid)
+    services.complete_order(conn, oid)
+    services.delete_device(conn, js)          # now free -> allowed
+    assert services.get_device(conn, js) is None
+
+
+# --- Devices: rendering inside order text ----------------------------------
+def test_order_devices_lines_renders_attached_devices(conn):
+    ps = services.add_device(conn, name="PS5 №1", dtype="playstation")
+    j1 = services.add_device(conn, name="Joystik A", dtype="joystick")
+    j2 = services.add_device(conn, name="Joystik C", dtype="joystick")
+    oid = _order_with_devices(conn, [ps, j1, j2])
+
+    lines = services.order_devices_lines(services.order_devices(conn, oid))
+    assert lines[0] == "🎮 PlayStation: PS5 №1"
+    assert lines[1].startswith("🕹 Joystiklar: 2 ta (")
+    assert "Joystik A" in lines[1] and "Joystik C" in lines[1]
+
+
+def test_order_with_no_devices_renders_dashes(conn):
+    oid = services.create_order(conn, customer_name="A", order_type="tungi", amount=1000)
+    lines = services.order_devices_lines(services.order_devices(conn, oid))
+    assert lines == ["🎮 PlayStation: —", "🕹 Joystiklar: —"]
+
+
+# --- Devices: auto-migration of a pre-existing DB lacking the new tables ----
+def test_auto_migration_adds_device_tables(tmp_path):
+    db = tmp_path / "legacy2.db"
+    c = database.get_connection(str(db))
+    c.executescript(_OLD_SCHEMA)
+    c.commit()
+    c.close()
+
+    # Re-opening through init_db must add the device tables with no data loss.
+    c = database.init_db(str(db))
+    tables = {r["name"] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert {"devices", "order_devices"} <= tables
+    ps = services.add_device(c, name="PS5 №1", dtype="playstation")
+    assert services.get_device(c, ps)["is_busy"] == 0
+    c.close()
+
+
+# --- Group message builders (Uzbek text + HTML tags) -----------------------
+def test_snapshot_message_created_header_and_devices():
+    msg = services.build_devices_snapshot_message(
+        ["PS5 №2", "PS4 Pro"], ["Joystik B", "Joystik D", "Joystik E"], confirmed=False
+    )
+    assert "🆕 <b>Yangi buyurtma tushdi!</b>" in msg
+    assert "hali ham" in msg
+    assert "🎮 <b>Bo'sh PlayStationlar:</b>" in msg
+    assert " • PS5 №2" in msg
+    assert "🕹 <b>Bo'sh joystiklar:</b> 3 ta" in msg
+    # Customer-facing: no client data ever.
+    assert "so'm" not in msg
+
+
+def test_snapshot_message_confirmed_header():
+    msg = services.build_devices_snapshot_message(["PS5 №1"], [], confirmed=True)
+    assert "✅ <b>Yangi buyurtma tushdi!</b>" in msg
+    assert "hali ham" in msg
+
+
+def test_snapshot_message_all_busy_variant():
+    msg = services.build_devices_snapshot_message([], [], confirmed=False)
+    assert "😔 Hozircha barcha qurilmalar band" in msg
+
+
+def test_freed_message_lists_available_devices():
+    msg = services.build_devices_freed_message(["PS5 №1", "PS5 №2"], ["J1", "J2", "J3", "J4"])
+    assert "🎉 <b>Qurilmalar bo'shadi!</b>" in msg
+    assert " • PS5 №1" in msg
+    assert "🕹 <b>Joystiklar:</b> 4 ta" in msg
+
+
+def test_promo_announcement_message_has_period_price_and_body():
+    msg = services.build_promo_announcement_message(
+        "Dushanba va Seshanba kunlari", 25_000, body="PS5 uchun maxsus chegirma!",
+    )
+    assert "🔥 <b>AKSIYA! Chegirma!</b>" in msg
+    assert "📅 <b>Muddat:</b> Dushanba va Seshanba kunlari" in msg   # free text
+    assert "25 000 so'm" in msg                                       # thousands separator
+    assert "PS5 uchun maxsus chegirma!" in msg
+
+
+def test_promo_announcement_message_without_body():
+    msg = services.build_promo_announcement_message(
+        "Shu hafta oxirigacha", 25_000, body="",
+    )
+    assert "🔥 <b>AKSIYA! Chegirma!</b>" in msg
+    assert "📞 <i>Buyurtma berish uchun biz bilan bog'laning!</i>" in msg
+
+
+def test_promo_announcement_message_escapes_period_and_body():
+    msg = services.build_promo_announcement_message(
+        "<i>hafta</i>", 10_000, body="<b>hack</b> & co",
+    )
+    assert "&lt;i&gt;hafta&lt;/i&gt;" in msg
+    assert "&lt;b&gt;hack&lt;/b&gt; &amp; co" in msg
+    assert "<b>hack</b>" not in msg
+
+
+def test_group_messages_html_escape_device_names():
+    msg = services.build_devices_snapshot_message(["<PS>&1"], [], confirmed=False)
+    assert "&lt;PS&gt;&amp;1" in msg
+    assert "<PS>&1" not in msg

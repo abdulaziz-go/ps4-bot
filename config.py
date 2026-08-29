@@ -38,6 +38,20 @@ ADMIN_IDS: set[int] = _parse_ids(os.environ.get("ADMIN_IDS", ""))
 SUPERADMIN_IDS: set[int] = _parse_ids(os.environ.get("SUPERADMIN_IDS", ""))
 DB_PATH: str = os.environ.get("DB_PATH", "bot.db")
 
+
+def _parse_int(raw: str, default: int) -> int:
+    """Parse a single integer env value, falling back to ``default`` if unset/bad."""
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+# Customer-facing group/supergroup where the bot posts device-availability
+# announcements. The bot is otherwise SILENT in every group — it never replies
+# to anything written there. Stored as an int (Telegram group IDs are negative).
+GROUP_CHAT_ID: int = _parse_int(os.environ.get("GROUP_CHAT_ID"), -1004439378633)
+
 # --- Business rules ---------------------------------------------------------
 # Cancellation fee (so'm) charged when a *confirmed* order is cancelled.
 CANCEL_FEES: dict[str, int] = {
@@ -90,6 +104,7 @@ def env_summary() -> str:
         f"   ADMIN_IDS      : {_fmt(ADMIN_IDS)}\n"
         f"   SUPERADMIN_IDS : {_fmt(SUPERADMIN_IDS)}\n"
         f"   DB_PATH        : {DB_PATH}\n"
+        f"   GROUP_CHAT_ID  : {GROUP_CHAT_ID}\n"
         f"   SPLIT_A_LABEL  : {SPLIT_A_LABEL}\n"
         f"   SPLIT_B_LABEL  : {SPLIT_B_LABEL}"
     )
