@@ -285,6 +285,80 @@ def monthly_report(conn: sqlite3.Connection, year: int, month: int) -> dict:
     }
 
 
+def overall_report(conn: sqlite3.Connection) -> dict:
+    """Aggregate ALL revenue since the last reset, across every month.
+
+    Same shape / 60-40 split as ``monthly_report`` but not scoped to a calendar
+    month — it counts every completed amount + cancellation fee finalised after
+    the most recent ``nollash`` (global). ``since`` is that reset timestamp (or
+    None if never reset). This is what the 📊 Hisobot button shows.
+    """
+    reset_at = last_reset_at(conn)  # global: most recent reset of any month
+
+    completed = conn.execute(
+        """SELECT COUNT(*) AS c, COALESCE(SUM(amount), 0) AS s
+             FROM orders
+            WHERE status='completed'
+              AND (? IS NULL OR completed_at > ?)""",
+        (reset_at, reset_at),
+    ).fetchone()
+    cancelled = conn.execute(
+        """SELECT COUNT(*) AS c, COALESCE(SUM(cancel_fee), 0) AS s
+             FROM orders
+            WHERE status='cancelled'
+              AND (? IS NULL OR cancelled_at > ?)""",
+        (reset_at, reset_at),
+    ).fetchone()
+
+    completed_amount = completed["s"]
+    cancel_fees = cancelled["s"]
+    total = completed_amount + cancel_fees
+    share_a = total * SPLIT_A_PCT // 100
+    share_b = total - share_a
+
+    return {
+        "since": reset_at,
+        "completed_count": completed["c"],
+        "completed_amount": completed_amount,
+        "cancelled_count": cancelled["c"],
+        "cancel_fees": cancel_fees,
+        "total_revenue": total,
+        "share_a": share_a,
+        "share_b": share_b,
+    }
+
+
+def reset_overall(
+    conn: sqlite3.Connection,
+    reset_by: int | None = None,
+    now: datetime | None = None,
+) -> dict:
+    """Snapshot the whole since-last-reset report into ``resets`` and zero it.
+
+    Unlike the month-scoped ``reset_report``, this closes the entire running
+    tally (all months since the previous reset). The snapshot's year/month record
+    *when* the reset happened, for the history list. Afterwards ``overall_report``
+    returns zero until new orders are finalised.
+    """
+    snapshot = overall_report(conn)
+    ts = now or datetime.now()
+    conn.execute(
+        """INSERT INTO resets
+               (reset_at, reset_by, year, month,
+                completed_count, completed_amount, cancelled_count, cancel_fees,
+                total_revenue, share_a, share_b)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            _now_iso(now), reset_by, ts.year, ts.month,
+            snapshot["completed_count"], snapshot["completed_amount"],
+            snapshot["cancelled_count"], snapshot["cancel_fees"],
+            snapshot["total_revenue"], snapshot["share_a"], snapshot["share_b"],
+        ),
+    )
+    conn.commit()
+    return snapshot
+
+
 def reset_report(
     conn: sqlite3.Connection,
     year: int,

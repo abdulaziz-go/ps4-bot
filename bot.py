@@ -214,6 +214,21 @@ def format_report(r) -> str:
     )
 
 
+def format_overall_report(r) -> str:
+    """Cumulative report since the last nollash (all months combined)."""
+    since = fmt_dt(r["since"]) if r["since"] else "boshidan beri"
+    return (
+        f"📊 <b>Umumiy hisobot</b>\n"
+        f"<i>(oxirgi nollashdan beri: {since})</i>\n\n"
+        f"☑️ Yakunlangan: {r['completed_count']} ta — {money(r['completed_amount'])} so'm\n"
+        f"❌ Bekor (to'lov): {r['cancelled_count']} ta — {money(r['cancel_fees'])} so'm\n"
+        f"━━━━━━━━━━━━━━━━━\n"
+        f"💰 Jami tushum: <b>{money(r['total_revenue'])} so'm</b>\n\n"
+        f"{config.SPLIT_A_LABEL}: {money(r['share_a'])} so'm\n"
+        f"{config.SPLIT_B_LABEL}: {money(r['share_b'])} so'm"
+    )
+
+
 def format_reset_entry(row, index: int) -> str:
     """One saved reset snapshot for the history list.
 
@@ -459,9 +474,9 @@ def _do_history(message):
 
 
 def _do_report(message):
-    now = datetime.now()
-    r = services.monthly_report(conn, now.year, now.month)
-    bot.reply_to(message, format_report(r))
+    # Cumulative total since the last nollash (spans all months), not one month.
+    r = services.overall_report(conn)
+    bot.reply_to(message, format_overall_report(r))
 
 
 def _do_reset_history(message):
@@ -480,19 +495,18 @@ def _do_reset(message):
     if not config.is_superadmin(message.from_user.id):
         bot.reply_to(message, "⛔ Bu amal faqat SUPERADMIN uchun.")
         return
-    now = datetime.now()
-    r = services.monthly_report(conn, now.year, now.month)
+    r = services.overall_report(conn)
     kb = types.InlineKeyboardMarkup()
     kb.add(
-        types.InlineKeyboardButton("Ha, nollash ✅", callback_data=f"reset_yes:{now.year}:{now.month}"),
+        types.InlineKeyboardButton("Ha, nollash ✅", callback_data="reset_yes_all"),
         types.InlineKeyboardButton("Yo'q ❌", callback_data="reset_no"),
     )
     bot.send_message(
         message.chat.id,
         "♻️ <b>Hisobotni nollash</b>\n\n"
-        "Joriy hisobot tarixga saqlanadi va nolga tushiriladi.\n"
+        "Joriy umumiy hisobot tarixga saqlanadi va nolga tushiriladi.\n"
         "Buyurtmalar o'chirilmaydi.\n\n"
-        f"{format_report(r)}\n\n"
+        f"{format_overall_report(r)}\n\n"
         "Davom etamizmi?",
         reply_markup=kb,
     )
@@ -874,7 +888,7 @@ def cb_cancel_no(call):
                           reply_markup=order_markup(o))
 
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("reset_yes:"))
+@bot.callback_query_handler(func=lambda c: c.data == "reset_yes_all")
 def cb_reset_yes(call):
     """Confirmed reset — superadmin only. Saves the snapshot, then zeroes."""
     if not _guard_cb(call):
@@ -882,12 +896,11 @@ def cb_reset_yes(call):
     if not config.is_superadmin(call.from_user.id):
         bot.answer_callback_query(call.id, "⛔ Faqat SUPERADMIN", show_alert=True)
         return
-    _, year, month = call.data.split(":")
-    snap = services.reset_report(conn, int(year), int(month), reset_by=call.from_user.id)
+    snap = services.reset_overall(conn, reset_by=call.from_user.id)
     bot.answer_callback_query(call.id, "Nollandi ♻️")
     bot.edit_message_text(
         "✅ Hisobot nollandi va tarixga saqlandi.\n\n"
-        f"<b>Saqlangan hisobot:</b>\n{format_report(snap)}",
+        f"<b>Saqlangan hisobot:</b>\n{format_overall_report(snap)}",
         call.message.chat.id,
         call.message.message_id,
     )

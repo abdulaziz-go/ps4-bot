@@ -283,6 +283,40 @@ def test_last_reset_at_none_when_never_reset(conn):
     assert services.last_reset_at(conn, 2026, 8) is None
 
 
+# --- Overall (all-month, since-reset) report --------------------------------
+def test_overall_report_spans_multiple_months(conn):
+    _complete(conn, 100_000, datetime(2026, 7, 15))
+    _complete(conn, 200_000, datetime(2026, 8, 20))
+    _complete(conn, 50_000, datetime(2026, 9, 1))
+
+    r = services.overall_report(conn)
+    assert r["completed_count"] == 3
+    assert r["total_revenue"] == 350_000           # every month combined
+    assert r["share_a"] == 210_000                 # 60%
+    assert r["share_b"] == 140_000                 # 40%
+    assert r["since"] is None                       # never reset yet
+
+
+def test_reset_overall_zeroes_all_months_and_saves_snapshot(conn):
+    _complete(conn, 100_000, datetime(2026, 7, 15))
+    _complete(conn, 200_000, datetime(2026, 8, 20))
+    assert services.overall_report(conn)["total_revenue"] == 300_000
+
+    snap = services.reset_overall(conn, reset_by=7, now=datetime(2026, 9, 1, 12, 0, 0))
+    assert snap["total_revenue"] == 300_000
+    assert snap["completed_count"] == 2
+
+    # After the reset the running total is zero across all months...
+    assert services.overall_report(conn)["total_revenue"] == 0
+    # ...and orders finalised afterwards count again.
+    _complete(conn, 40_000, datetime(2026, 9, 2, 10, 0, 0))
+    assert services.overall_report(conn)["total_revenue"] == 40_000
+
+    # The snapshot is recorded in the reset history.
+    rows = services.list_resets(conn)
+    assert rows[0]["total_revenue"] == 300_000
+
+
 # --- Third order type: "Bir kun to'liq" ------------------------------------
 def test_bir_kun_type_is_accepted(conn):
     oid = services.create_order(
